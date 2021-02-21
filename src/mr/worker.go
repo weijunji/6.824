@@ -1,10 +1,16 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"time"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -24,18 +30,110 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+func doMap(mapf func(string, string) []KeyValue, job *Job, nReduce int) (files []string) {
+	outFiles := make([]*os.File, nReduce)
+	for idx := range outFiles {
+		outFile, err := ioutil.TempFile("./", "mr-tmp-*")
+		if err != nil {
+			log.Fatalf("create tmp file failed: %v", err)
+		}
+		defer outFile.Close()
+		outFiles[idx] = outFile
+	}
+	for _, filename := range job.Files {
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatalf("cannot open %v", filename)
+		}
+		content, err := ioutil.ReadAll(file)
+		if err != nil {
+			log.Fatalf("cannot read %v", filename)
+		}
+		file.Close()
+		kva := mapf(filename, string(content))
+		for _, kv := range kva {
+			hash := ihash(kv.Key) % nReduce
+			js, _ := json.Marshal(kv)
+			outFiles[hash].Write(js)
+			outFiles[hash].WriteString("\n")
+		}
+	}
+	for idx := range outFiles {
+		filename := fmt.Sprintf("mr-%d-%d", job.Index, idx)
+		os.Rename(outFiles[idx].Name(), filename)
+		files = append(files, filename)
+	}
+	return
+}
+
+func doReduce(reducef func(string, []string) string, job *Job, nMap int) {
+	log.Printf("Start reduce %d", job.Index)
+	outFile, err := ioutil.TempFile("./", "mr-out-tmp-*")
+	defer outFile.Close()
+	if err != nil {
+		log.Fatalf("create tmp file failed: %v", err)
+	}
+	m := make(map[string][]string)
+	for _, filename := range job.Files {
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatalf("cannot open %v", filename)
+		}
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			kv := KeyValue{}
+			if err := json.Unmarshal(scanner.Bytes(), &kv); err != nil {
+				log.Fatalf("read kv failed: %v", err)
+			}
+			m[kv.Key] = append(m[kv.Key], kv.Value)
+		}
+		if err := scanner.Err(); err != nil {
+			log.Fatal(err)
+		}
+		file.Close()
+	}
+	for key, value := range m {
+		output := reducef(key, value)
+		fmt.Fprintf(outFile, "%v %v\n", key, output)
+	}
+	os.Rename(outFile.Name(), fmt.Sprintf("mr-out-%d", job.Index))
+	log.Printf("End reduce %d", job.Index)
+}
 
 //
 // main/mrworker.go calls this function.
 //
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
-
+	CallExample()
+	var status int = MAP
+	args := AcquireJobArgs{Job{Index: -1}, MAP}
+	for {
+		args.Status = status
+		reply := AcquireJobReply{}
+		call("Coordinator.AcquireJob", &args, &reply)
+		fmt.Printf("AcReply: %+v\n", reply)
+		if reply.Status == FINISH {
+			break
+		}
+		status = reply.Status
+		if reply.Job.Index >= 0 {
+			// get a job, do it
+			commitJob := reply.Job
+			if status == MAP {
+				commitJob.Files = doMap(mapf, &reply.Job, reply.NOther)
+			} else {
+				doReduce(reducef, &reply.Job, reply.NOther)
+				commitJob.Files = make([]string, 0)
+			}
+			// job finished
+			args = AcquireJobArgs{commitJob, status}
+		} else {
+			// no job, sleep to wait
+			time.Sleep(time.Second)
+			args = AcquireJobArgs{Job{Index: -1}, status}
+		}
+	}
 }
 
 //
